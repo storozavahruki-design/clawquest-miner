@@ -1,8 +1,28 @@
 #!/bin/bash
 set -e
 
-echo "=== Запуск сервера Skill ==="
-node node_modules/@zhzai30/clawquest-agent-mine-openclaw/dist/index.js &
+echo "=== Установка Skill через ClawHub ==="
+clawhub install @zhzai30/clawquest-agent-mine-openclaw || {
+  echo "CLI установка не удалась, пробуем git..."
+  git clone https://github.com/zhzai30/clawquest-agent-mine-openclaw.git /tmp/skill
+  cp -r /tmp/skill/* /app/
+  npm install
+}
+
+echo "=== Запуск Skill ==="
+# Ищем правильный путь запуска
+if [ -f "dist/index.js" ]; then
+  node dist/index.js &
+elif [ -f "index.js" ]; then
+  node index.js &
+elif [ -f "src/index.js" ]; then
+  node src/index.js &
+else
+  echo "Ищу entry point..."
+  ls -la
+  ls -la dist/ 2>/dev/null || true
+  ls -la src/ 2>/dev/null || true
+fi
 
 echo "=== Ожидание сервера ==="
 for i in $(seq 1 30); do
