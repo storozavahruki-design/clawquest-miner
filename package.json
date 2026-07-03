@@ -1,0 +1,8 @@
+{
+  "name": "clawquest-miner",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@zhzai30/clawquest-agent-mine-openclaw": "latest"
+  }
+}
