@@ -1,13 +1,17 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+
 const gameApiBaseUrl = process.env.GAME_API_BASE_URL ?? "https://api.km.cocweb3.com";
 const requestTimeoutMilliseconds = Number(process.env.REQUEST_TIMEOUT_MS ?? "8000");
+
 const oreTypeNameMapPath = process.env.ORE_TYPE_NAME_MAP_PATH ??
     path.join(process.cwd(), "config", "ore-type-map.json");
+
 const defaultManagedPollingIntervalMilliseconds = Number(process.env.MANAGED_MINING_POLL_INTERVAL_MS ?? "1000");
 const defaultManagedRoundIntervalMilliseconds = Number(process.env.MANAGED_MINING_ROUND_INTERVAL_MS ?? "2000");
 const defaultManagedMaxConsecutiveErrorCount = Number(process.env.MANAGED_MINING_MAX_CONSECUTIVE_ERROR_COUNT ?? "10");
 const defaultAutoBuyStaminaMaxFailures = Number(process.env.MANAGED_MINING_AUTO_BUY_MAX_FAILURES ?? "3");
+
 const defaultLanguage = "zh_CN";
 const supportedLanguages = new Set([
     "zh_CN",
@@ -17,7 +21,9 @@ const supportedLanguages = new Set([
     "ko_KR",
     "ru_RU",
 ]);
+
 let oreTypeNameMapCache;
+
 export class GameApiHttpError extends Error {
     statusCode;
     responseBody;
@@ -28,6 +34,7 @@ export class GameApiHttpError extends Error {
         this.responseBody = responseBody;
     }
 }
+
 const SERVER_ERROR = {
     COMMON_INVALID_PARAMS: 400,
     COMMON_NOT_ENOUGH_RESOURCES: 1010,
@@ -37,23 +44,25 @@ const SERVER_ERROR = {
     GAME_MINING_API_NOT_ACTIVE: 2014,
     GAME_MINING_NOT_FINISHED: 2018,
 };
+
 function isInsufficientStaminaCode(code) {
     return code === SERVER_ERROR.GAME_INSUFFICIENT_RESOURCES;
 }
+
 function isCriticalStopCode(code) {
     return (code === SERVER_ERROR.GAME_DIAMOND_NOT_ENOUGH ||
         code === SERVER_ERROR.GAME_MINING_API_NOT_ACTIVE ||
         code === SERVER_ERROR.COMMON_INVALID_PARAMS);
 }
+
 function isMiningStateConflictCode(code) {
     return code === SERVER_ERROR.GAME_MINING_STATE_CONFLICT;
 }
-/**
- * Whether endMining should keep polling without escalating the error.
- */
+
 function isPollingRewardRetryableCode(code) {
     return code === SERVER_ERROR.GAME_MINING_NOT_FINISHED;
 }
+
 function extractServerErrorCode(responseBody) {
     if (!responseBody || typeof responseBody !== "object") {
         return undefined;
@@ -61,6 +70,7 @@ function extractServerErrorCode(responseBody) {
     const body = responseBody;
     return typeof body.code === "number" ? body.code : undefined;
 }
+
 function extractGetStaminaSnapshot(envelope) {
     if (!envelope || typeof envelope !== "object") {
         return undefined;
@@ -83,6 +93,7 @@ function extractGetStaminaSnapshot(envelope) {
     }
     return { stamina, diamonds, maxStamina };
 }
+
 function isBuyStaminaDiamondInsufficientCode(code) {
     if (code === undefined) {
         return false;
@@ -90,6 +101,7 @@ function isBuyStaminaDiamondInsufficientCode(code) {
     return (code === SERVER_ERROR.COMMON_NOT_ENOUGH_RESOURCES ||
         code === SERVER_ERROR.GAME_DIAMOND_NOT_ENOUGH);
 }
+
 async function tryAutoBuyStaminaAfterInsufficientResources(apiCode) {
     const getResult = await executePostWithApiCode("/api/getStamina", apiCode, {});
     if (getResult.httpStatus < 200 || getResult.httpStatus >= 300) {
@@ -121,13 +133,15 @@ async function tryAutoBuyStaminaAfterInsufficientResources(apiCode) {
     }
     return "failed";
 }
+
 export async function startMining(apiCode) {
     return await postJson("/api/startMining", apiCode, {});
 }
+
 export async function checkMiningState(apiCode) {
     return await postJson("/api/checkMiningState", apiCode, {});
 }
-/** 同步服务端 MiningRuntime.apiAutoMining（托管循环开始时 true，结束时 false）。 */
+
 export async function setApiAutoMining(apiCode, enabled) {
     const body = await postJson("/api/setAutoMining", apiCode, { enabled });
     const code = extractServerErrorCode(body);
@@ -135,16 +149,20 @@ export async function setApiAutoMining(apiCode, enabled) {
         throw new GameApiHttpError(502, `setAutoMining failed code=${code}`, body);
     }
 }
+
 export async function endMining(apiCode, lang) {
     const response = await postJson("/api/endMining", apiCode, {});
     return await enrichRewardResponse(response, lang);
 }
+
 export async function fetchGameApiWithApiCodePost(path, apiCode, jsonBody) {
     return await executePostWithApiCode(path, apiCode, jsonBody);
 }
+
 export async function enrichEndMiningResponseForDisplay(response, lang) {
     return await enrichRewardResponse(response, lang);
 }
+
 export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, options) {
     const normalizedLanguage = normalizeLanguage(options?.lang);
     const pollingIntervalMilliseconds = normalizePositiveInteger(options?.pollingIntervalMilliseconds, defaultManagedPollingIntervalMilliseconds);
@@ -152,40 +170,46 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
     const maxConsecutiveErrorCount = normalizePositiveInteger(options?.maxConsecutiveErrorCount, defaultManagedMaxConsecutiveErrorCount);
     const autoBuyStaminaEnabled = options?.autoBuyStaminaEnabled === true;
     const autoBuyStaminaMaxFailuresConfigured = normalizePositiveInteger(options?.autoBuyStaminaMaxFailures, defaultAutoBuyStaminaMaxFailures);
+
     let roundsCompleted = 0;
     let consecutiveErrorCount = 0;
     let autoBuyStaminaFailureCount = 0;
     let lastError;
     let lastRewardDetails;
     let lastCheckState;
+
     while (shouldContinue()) {
         try {
             callbacks?.onPhaseChanged?.("starting_round");
+
             let startMiningState;
             try {
                 startMiningState = await startMining(apiCode);
                 consecutiveErrorCount = 0;
                 lastError = undefined;
-            }
-            catch (error) {
+            } catch (error) {
                 throw error;
             }
+
             const now = Date.now();
             let estimatedEndAt = extractEstimatedEndAt(startMiningState);
             if (!estimatedEndAt || estimatedEndAt <= now) {
                 estimatedEndAt = now + 60000;
-            }
-            else {
+            } else {
                 estimatedEndAt = Math.min(estimatedEndAt + 10000, now + 60000);
             }
+
             callbacks?.onPhaseChanged?.("waiting_estimated_end_at", {
                 estimatedEndAt,
             });
+
             await sleepWithContinueCheck(estimatedEndAt - Date.now(), shouldContinue);
             if (!shouldContinue()) {
                 break;
             }
+
             callbacks?.onPhaseChanged?.("polling_reward");
+
             while (shouldContinue()) {
                 try {
                     const endResult = await endMining(apiCode, normalizedLanguage);
@@ -196,21 +220,24 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                     autoBuyStaminaFailureCount = 0;
                     consecutiveErrorCount = 0;
                     lastError = undefined;
+
                     callbacks?.onRoundCompleted?.({
                         rewardDetails,
                         checkState: endResult,
                     });
+
                     callbacks?.onPhaseChanged?.("reward_collected", {
                         rewardCount: rewardDetails.length,
                         roundsCompleted,
                     });
+
                     callbacks?.onPhaseChanged?.("sleeping_between_rounds", {
                         roundIntervalMilliseconds,
                     });
+
                     await sleepWithContinueCheck(roundIntervalMilliseconds, shouldContinue);
                     break;
-                }
-                catch (endError) {
+                } catch (endError) {
                     if (endError instanceof GameApiHttpError) {
                         const serverCode = extractServerErrorCode(endError.responseBody);
                         if (serverCode !== undefined && isCriticalStopCode(serverCode)) {
@@ -225,10 +252,10 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                     throw endError;
                 }
             }
-        }
-        catch (error) {
+        } catch (error) {
             if (error instanceof GameApiHttpError) {
                 const serverCode = extractServerErrorCode(error.responseBody);
+
                 if (autoBuyStaminaEnabled &&
                     serverCode !== undefined &&
                     isInsufficientStaminaCode(serverCode)) {
@@ -241,6 +268,7 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                     autoBuyStaminaFailureCount += 1;
                     lastError = `stamina_insufficient_auto_buy_failed count=${autoBuyStaminaFailureCount} max=${autoBuyStaminaMaxFailuresConfigured}`;
                     callbacks?.onError?.(lastError, autoBuyStaminaFailureCount, autoBuyStaminaMaxFailuresConfigured);
+
                     if (autoBuyStaminaFailureCount >= autoBuyStaminaMaxFailuresConfigured) {
                         callbacks?.onPhaseChanged?.("stopping", {
                             stopReason: "auto_buy_stamina_exhausted",
@@ -258,9 +286,11 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                             lastCheckState,
                         };
                     }
+
                     await sleepWithContinueCheck(pollingIntervalMilliseconds, shouldContinue);
                     continue;
                 }
+
                 if (serverCode !== undefined && isCriticalStopCode(serverCode)) {
                     consecutiveErrorCount += 1;
                     lastError = getErrorMessage(error);
@@ -281,9 +311,11 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                     };
                 }
             }
+
             consecutiveErrorCount += 1;
             lastError = getErrorMessage(error);
             callbacks?.onError?.(lastError, consecutiveErrorCount, maxConsecutiveErrorCount);
+
             if (consecutiveErrorCount >= maxConsecutiveErrorCount) {
                 callbacks?.onPhaseChanged?.("stopping", {
                     stopReason: "error_limit_reached",
@@ -299,9 +331,11 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
                     lastCheckState,
                 };
             }
+
             await sleepWithContinueCheck(pollingIntervalMilliseconds, shouldContinue);
         }
     }
+
     callbacks?.onPhaseChanged?.("stopping", { stopReason: "stopped_by_user" });
     return {
         stopReason: "stopped_by_user",
@@ -313,15 +347,18 @@ export async function runManagedMiningLoop(apiCode, shouldContinue, callbacks, o
         lastCheckState,
     };
 }
+
 async function executePostWithApiCode(path, apiCode, jsonBody) {
     const sanitizedApiCode = apiCode.trim();
     if (!sanitizedApiCode) {
         throw new Error("invalid_api_code");
     }
+
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => {
         abortController.abort();
     }, requestTimeoutMilliseconds);
+
     try {
         const response = await fetch(`${gameApiBaseUrl}${path}`, {
             method: "POST",
@@ -334,17 +371,16 @@ async function executePostWithApiCode(path, apiCode, jsonBody) {
         });
         const responseJson = (await response.json());
         return { httpStatus: response.status, body: responseJson };
-    }
-    catch (error) {
+    } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
             throw new Error(`game_api_timeout timeoutMs=${requestTimeoutMilliseconds}`);
         }
         throw error;
-    }
-    finally {
+    } finally {
         clearTimeout(timeoutHandle);
     }
 }
+
 async function postJson(path, apiCode, body) {
     const { httpStatus, body: responseBody } = await executePostWithApiCode(path, apiCode, body);
     if (httpStatus < 200 || httpStatus >= 300) {
@@ -352,6 +388,7 @@ async function postJson(path, apiCode, body) {
     }
     return responseBody;
 }
+
 function extractEstimatedEndAt(startState) {
     if (!startState || typeof startState !== "object") {
         return undefined;
@@ -363,6 +400,7 @@ function extractEstimatedEndAt(startState) {
     }
     return estimatedEndAt;
 }
+
 function extractRewardDetails(checkState) {
     if (!checkState || typeof checkState !== "object") {
         return [];
@@ -376,6 +414,7 @@ function extractRewardDetails(checkState) {
         ...resourceResultItem,
     }));
 }
+
 function normalizePositiveInteger(value, fallbackValue) {
     const normalizedValue = Math.floor(Number(value));
     if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
@@ -383,12 +422,14 @@ function normalizePositiveInteger(value, fallbackValue) {
     }
     return normalizedValue;
 }
+
 function getErrorMessage(error) {
     if (error instanceof Error) {
         return error.message;
     }
     return String(error);
 }
+
 async function sleepWithContinueCheck(totalMilliseconds, shouldContinue) {
     const normalizedMilliseconds = Math.max(0, Math.floor(totalMilliseconds));
     if (normalizedMilliseconds <= 0) {
@@ -401,9 +442,11 @@ async function sleepWithContinueCheck(totalMilliseconds, shouldContinue) {
         remainingMilliseconds -= currentSleepMilliseconds;
     }
 }
+
 async function enrichRewardResponse(response, lang) {
     const oreTypeNameMap = await loadOreTypeNameMap();
     const normalizedLanguage = normalizeLanguage(lang);
+
     if (!response || typeof response !== "object") {
         return response;
     }
@@ -412,6 +455,7 @@ async function enrichRewardResponse(response, lang) {
     if (!Array.isArray(resultList)) {
         return response;
     }
+
     for (const resultItem of resultList) {
         const oreTypeValue = Number(resultItem.oreType);
         if (!Number.isFinite(oreTypeValue)) {
@@ -430,6 +474,7 @@ async function enrichRewardResponse(response, lang) {
     }
     return responseObject;
 }
+
 async function loadOreTypeNameMap() {
     if (oreTypeNameMapCache) {
         return oreTypeNameMapCache;
@@ -439,12 +484,12 @@ async function loadOreTypeNameMap() {
         const parsed = JSON.parse(fileContent);
         oreTypeNameMapCache = parsed.oreTypeNameMap ?? {};
         return oreTypeNameMapCache;
-    }
-    catch {
+    } catch {
         oreTypeNameMapCache = {};
         return oreTypeNameMapCache;
     }
 }
+
 function normalizeLanguage(lang) {
     const normalizedLanguage = String(lang ?? "").trim();
     if (!supportedLanguages.has(normalizedLanguage)) {
