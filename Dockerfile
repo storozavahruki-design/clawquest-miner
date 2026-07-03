@@ -6,4 +6,4 @@ RUN npm install
 COPY . .
 RUN chmod +x start.sh
 EXPOSE 10000
-CMD ["./start.sh"]
+CMD ["bash", "-c", "while true; do ./start.sh; echo 'Restarting after crash...'; sleep 5; done"]
