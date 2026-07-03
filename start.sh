@@ -1,53 +1,98 @@
-#!/bin/bash
-set -e
+import fetch from 'node-fetch';
 
-echo "=== Установка Skill через ClawHub ==="
-clawhub install @zhzai30/clawquest-agent-mine-openclaw || {
-  echo "CLI установка не удалась, пробуем git..."
-  git clone https://github.com/zhzai30/clawquest-agent-mine-openclaw.git /tmp/skill
-  cp -r /tmp/skill/* /app/
-  npm install
+const API_BASE = 'https://api.km.cocweb3.com';
+const API_CODE = '1462374659c949daba11e69a4065b9be';
+
+const headers = {
+  'X-Api-Code': API_CODE,
+  'Content-Type': 'application/json'
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function apiCall(endpoint, body = {}) {
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    console.log(`${endpoint}:`, JSON.stringify(data));
+    return data;
+  } catch (err) {
+    console.error(`${endpoint} ошибка:`, err.message);
+    return null;
+  }
 }
 
-echo "=== Запуск Skill ==="
-# Ищем правильный путь запуска
-if [ -f "dist/index.js" ]; then
-  node dist/index.js &
-elif [ -f "index.js" ]; then
-  node index.js &
-elif [ -f "src/index.js" ]; then
-  node src/index.js &
-else
-  echo "Ищу entry point..."
-  ls -la
-  ls -la dist/ 2>/dev/null || true
-  ls -la src/ 2>/dev/null || true
-fi
+async function checkState() {
+  const data = await apiCall('/api/checkMiningState', { apiCode: API_CODE });
+  return data?.data || {};
+}
 
-echo "=== Ожидание сервера ==="
-for i in $(seq 1 30); do
-  if curl -s http://localhost:10000/tool/check_mining_state \
-    -X POST -H "Content-Type: application/json" -d '{}' > /dev/null 2>&1; then
-    echo "Сервер готов"
-    break
-  fi
-  sleep 2
-done
+async function buyStamina() {
+  return await apiCall('/api/buyStamina', { apiCode: API_CODE });
+}
 
-echo "=== set_api_code ==="
-curl -s -X POST http://localhost:10000/tool/set_api_code \
-  -H "Content-Type: application/json" \
-  -d '{"apiCode":"1462374659c949daba11e69a4065b9be"}'
+async function startMining() {
+  return await apiCall('/api/startMining', { apiCode: API_CODE });
+}
 
-echo "=== start_mining_session ==="
-curl -s -X POST http://localhost:10000/tool/start_mining_session \
-  -H "Content-Type: application/json" \
-  -d '{"apiCode":"1462374659c949daba11e69a4065b9be","autoBuyStamina":true}'
+async function getStamina() {
+  const data = await apiCall('/api/getStamina', { apiCode: API_CODE });
+  return data?.data || {};
+}
 
-echo "=== Статус ==="
-curl -s -X POST http://localhost:10000/tool/check_mining_state \
-  -H "Content-Type: application/json" \
-  -d '{"apiCode":"1462374659c949daba11e69a4065b9be"}'
+async function miningLoop() {
+  console.log('=== Майнинг-цикл запущен ===');
+  let errors = 0;
 
-echo "=== Готово ==="
-wait
+  while (errors < 10) {
+    try {
+      const state = await checkState();
+      console.log(`Состояние: apiState=${state.apiState}, miningState=${state.miningState}`);
+
+      if (state.miningState === 1) {
+        console.log('Майнинг уже идёт, жду 60 сек...');
+        await sleep(60000);
+        continue;
+      }
+
+      const stamina = await getStamina();
+      if (stamina.stamina !== undefined && stamina.stamina < 1) {
+        console.log('Нет выносливости, покупаю...');
+        await buyStamina();
+        await sleep(5000);
+      }
+
+      const start = await startMining();
+      if (start?.code === 0) {
+        console.log('Майнинг запущен!');
+        errors = 0;
+        await sleep(300000);
+      } else if (start?.code === 2009) {
+        console.log('Конфликт состояний, жду...');
+        await sleep(30000);
+      } else if (start?.code === 2003) {
+        console.log('Недостаточно выносливости, покупаю...');
+        await buyStamina();
+        await sleep(10000);
+      } else if (start?.code === 2014) {
+        console.log('API майнинг не активирован в игре!');
+        await sleep(300000);
+      } else {
+        errors++;
+        await sleep(30000);
+      }
+    } catch (err) {
+      errors++;
+      console.error(`Ошибка #${errors}:`, err.message);
+      await sleep(30000);
+    }
+  }
+}
+
+console.log('=== ClawQuest Miner Starting ===');
+await sleep(5000);
+miningLoop();
