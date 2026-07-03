@@ -2,9 +2,16 @@ import express from "express";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { GameApiHttpError, fetchGameApiWithApiCodePost, runManagedMiningLoop, setApiAutoMining, } from "./tools.js";
+import {
+    GameApiHttpError,
+    fetchGameApiWithApiCodePost,
+    runManagedMiningLoop,
+    setApiAutoMining,
+} from "./tools.js";
+
 const app = express();
 app.use(express.json());
+
 const requestSchema = z.object({
     apiCode: z.string().trim().min(1).optional(),
     cacheKey: z.string().trim().min(1).optional(),
@@ -21,6 +28,7 @@ const requestSchema = z.object({
     autoBuyStamina: z.boolean().optional(),
     autoBuyStaminaMaxFailures: z.number().int().positive().optional(),
 });
+
 const apiCodeCache = new Map();
 const defaultCacheKey = "default";
 const apiCodeStorePath = process.env.API_CODE_STORE_PATH ??
@@ -29,10 +37,12 @@ const defaultManagedMaxConsecutiveErrorCount = Number(process.env.MANAGED_MINING
 const maxMiningSessionEventCount = Number(process.env.MINING_SESSION_MAX_EVENTS ?? "200");
 const defaultAutoBuyStaminaEnabledFromEnv = process.env.MANAGED_MINING_AUTO_BUY_STAMINA === "1" ||
     process.env.MANAGED_MINING_AUTO_BUY_STAMINA === "true";
+
 let managedMiningTask;
 let managedMiningStatus = buildIdleManagedMiningStatus();
 let miningSessionEventIdCounter = 0;
 let managedMiningTaskGeneration = 0;
+
 app.post("/tool/:name", async (req, res) => {
     const parsed = requestSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -41,6 +51,7 @@ app.post("/tool/:name", async (req, res) => {
     const toolName = req.params.name;
     const payload = parsed.data;
     const cacheKey = payload.cacheKey ?? defaultCacheKey;
+
     try {
         if (toolName === "set_api_code") {
             if (!payload.apiCode) {
@@ -116,8 +127,7 @@ app.post("/tool/:name", async (req, res) => {
                     managedMiningTask = undefined;
                     managedMiningTaskGeneration += 1;
                     managedMiningStatus = buildIdleManagedMiningStatus();
-                }
-                else {
+                } else {
                     return res.status(409).json({
                         ok: false,
                         error: "managed_mining_loop_already_running",
@@ -126,15 +136,18 @@ app.post("/tool/:name", async (req, res) => {
                     });
                 }
             }
+
             const maxConsecutiveErrorCount = normalizePositiveInteger(payload.maxConsecutiveErrorCount, defaultManagedMaxConsecutiveErrorCount);
             const openclawSessionKey = extractOpenClawSessionKey(req, payload);
             miningSessionEventIdCounter = 0;
             const loopGeneration = managedMiningTaskGeneration;
+
             managedMiningTask = {
                 stopRequested: false,
                 apiCode,
                 cacheKey,
             };
+
             managedMiningStatus = {
                 running: true,
                 phase: "starting_round",
@@ -154,12 +167,13 @@ app.post("/tool/:name", async (req, res) => {
                 openclawSessionKey: openclawSessionKey ?? null,
                 cacheKey,
             });
+
             try {
                 await setApiAutoMining(apiCode, true);
-            }
-            catch (error) {
+            } catch (error) {
                 console.warn("[skill-openclaw] setApiAutoMining(true) failed:", error);
             }
+
             void runManagedMiningLoop(apiCode, () => managedMiningTaskGeneration === loopGeneration &&
                 managedMiningTask !== undefined &&
                 !managedMiningTask.stopRequested, {
@@ -229,15 +243,12 @@ app.post("/tool/:name", async (req, res) => {
                 managedMiningStatus.criticalErrorCode = summary.criticalErrorCode;
                 if (summary.stopReason === "critical_error") {
                     managedMiningStatus.message = `Managed mining loop stopped by critical server error (code=${summary.criticalErrorCode}).`;
-                }
-                else if (summary.stopReason === "error_limit_reached") {
+                } else if (summary.stopReason === "error_limit_reached") {
                     managedMiningStatus.message =
                         "Managed mining loop stopped after reaching the consecutive error limit.";
-                }
-                else if (summary.stopReason === "auto_buy_stamina_exhausted") {
+                } else if (summary.stopReason === "auto_buy_stamina_exhausted") {
                     managedMiningStatus.message = `Managed mining loop stopped because auto-buy stamina failed ${summary.autoBuyStaminaFailureCount ?? 0} consecutive times. Refill resources and restart.`;
-                }
-                else {
+                } else {
                     managedMiningStatus.message =
                         "Managed mining loop stopped by request.";
                 }
@@ -280,14 +291,14 @@ app.post("/tool/:name", async (req, res) => {
                 .finally(async () => {
                 try {
                     await setApiAutoMining(apiCode, false);
-                }
-                catch (error) {
+                } catch (error) {
                     console.warn("[skill-openclaw] setApiAutoMining(false) failed:", error);
                 }
                 if (managedMiningTaskGeneration === loopGeneration) {
                     managedMiningTask = undefined;
                 }
             });
+
             return res.json({
                 ok: true,
                 data: {
@@ -357,8 +368,7 @@ app.post("/tool/:name", async (req, res) => {
                 message: "stop_auto_mining is deprecated. Use stop_managed_mining_loop.",
             });
         }
-    }
-    catch (error) {
+    } catch (error) {
         if (error instanceof GameApiHttpError) {
             const responseBody = error.responseBody;
             if (responseBody !== undefined &&
@@ -377,11 +387,14 @@ app.post("/tool/:name", async (req, res) => {
     }
     return res.status(404).json({ ok: false, error: "tool_not_found" });
 });
+
 app.get("/health", (_req, res) => {
     res.json({ ok: true, service: "skill-openclaw" });
 });
-const port = Number(process.env.PORT ?? "4021");
+
+const port = Number(process.env.PORT ?? "10000");
 void bootstrap();
+
 function resolveApiCode(payload, cacheKey) {
     if (payload.apiCode) {
         return payload.apiCode;
@@ -392,21 +405,23 @@ function resolveApiCode(payload, cacheKey) {
     }
     return cachedApiCode;
 }
+
 function resolveApiCodeOrBadRequest(res, payload, cacheKey) {
     try {
         return resolveApiCode(payload, cacheKey);
-    }
-    catch {
+    } catch {
         res.status(400).json({ error: "api_code_required_or_cache_miss" });
         return undefined;
     }
 }
+
 async function bootstrap() {
     await loadApiCodeStore();
     app.listen(port, () => {
         console.log(`skill-openclaw listening on :${port}`);
     });
 }
+
 async function loadApiCodeStore() {
     try {
         const fileContent = await readFile(apiCodeStorePath, "utf-8");
@@ -420,14 +435,14 @@ async function loadApiCodeStore() {
             }
             apiCodeCache.set(normalizedCacheKey, normalizedApiCode);
         }
-    }
-    catch (error) {
+    } catch (error) {
         if (error.code === "ENOENT") {
             return;
         }
         throw error;
     }
 }
+
 async function persistApiCodeStore() {
     const apiCodeRecord = Object.fromEntries(apiCodeCache.entries());
     const serializedStore = JSON.stringify({ apiCodes: apiCodeRecord }, null, 2);
@@ -436,10 +451,12 @@ async function persistApiCodeStore() {
     await writeFile(tmpPath, serializedStore, "utf-8");
     await rename(tmpPath, apiCodeStorePath);
 }
+
 async function upsertApiCode(cacheKey, apiCode) {
     apiCodeCache.set(cacheKey, apiCode.trim());
     await persistApiCodeStore();
 }
+
 function buildIdleManagedMiningStatus() {
     return {
         running: false,
@@ -454,6 +471,7 @@ function buildIdleManagedMiningStatus() {
         lastEventId: 0,
     };
 }
+
 function extractOpenClawSessionKey(req, payload) {
     const headerValue = req.get("x-openclaw-session-key");
     const fromHeader = normalizeOpenClawSessionKey(headerValue);
@@ -466,6 +484,7 @@ function extractOpenClawSessionKey(req, payload) {
     }
     return normalizeOpenClawSessionKey(payload.sessionKey);
 }
+
 function normalizeOpenClawSessionKey(value) {
     if (value === undefined) {
         return undefined;
@@ -473,6 +492,7 @@ function normalizeOpenClawSessionKey(value) {
     const trimmed = value.trim();
     return trimmed.length > 0 ? trimmed : undefined;
 }
+
 function appendMiningSessionEvent(eventType, eventPayload) {
     miningSessionEventIdCounter += 1;
     const miningSessionEvent = {
@@ -488,6 +508,7 @@ function appendMiningSessionEvent(eventType, eventPayload) {
         managedMiningStatus.events.shift();
     }
 }
+
 function generateStatusMessage(status) {
     if (!status.running) {
         return "Managed mining loop is not running";
@@ -500,6 +521,7 @@ function generateStatusMessage(status) {
     const rewardSummary = formatRewardSummary(status.lastRewardDetails);
     return `Round ${status.roundsCompleted} | ${rewardSummary} | Total Gold Bars ${goldCount} | Status: ${getRunningStatusText(status.phase)}`;
 }
+
 function getRunningStatusText(phase) {
     switch (phase) {
         case "starting_round":
@@ -517,6 +539,7 @@ function getRunningStatusText(phase) {
             return "mining";
     }
 }
+
 function formatRewardSummary(rewardDetails) {
     if (!Array.isArray(rewardDetails) || rewardDetails.length === 0) {
         return "no_reward";
@@ -538,6 +561,7 @@ function formatRewardSummary(rewardDetails) {
     }
     return parts.join(", ");
 }
+
 function mapManagedMiningPhaseToMessage(phase) {
     const messageByPhase = {
         idle: "Managed mining loop is not running.",
@@ -550,6 +574,7 @@ function mapManagedMiningPhaseToMessage(phase) {
     };
     return messageByPhase[phase];
 }
+
 function extractPlayerStatus(state) {
     if (!state || typeof state !== "object") {
         return undefined;
@@ -557,6 +582,7 @@ function extractPlayerStatus(state) {
     const stateObject = state;
     return stateObject.data?.commonInfo ?? stateObject.data?.playerStatus;
 }
+
 function normalizePositiveInteger(value, fallbackValue) {
     const normalizedValue = Math.floor(Number(value));
     if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
