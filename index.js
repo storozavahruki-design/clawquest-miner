@@ -41,65 +41,131 @@ async function startMining() {
   return await apiCall('/api/startMining', { apiCode: API_CODE });
 }
 
+async function endMining() {
+  return await apiCall('/api/endMining', { apiCode: API_CODE });
+}
+
 async function getStamina() {
   const data = await apiCall('/api/getStamina', { apiCode: API_CODE });
   return data?.data || {};
 }
 
 async function miningLoop() {
-  console.log('=== Майнинг-цикл запущен ===');
+  console.log('=== Управляемый майнинг-цикл запущен ===');
   let errors = 0;
+  let currentEstimatedEnd = null; // Храним ожидаемое время завершения
 
   while (errors < 10) {
     try {
+      // 1. Проверяем состояние
       const state = await checkState();
-      console.log(`Состояние: apiState=${state.apiState}, miningState=${state.miningState}`);
+      console.log(`[Состояние] apiState=${state.apiState}, miningState=${state.miningState}`);
 
-      if (state.miningState === 1) {
-        console.log('Майнинг уже идёт, жду 60 сек...');
+      // Если API не активно – ждём
+      if (state.apiState !== 1) {
+        console.log('API не активно, ожидаю 60 сек...');
         await sleep(60000);
         continue;
       }
 
-      const stamina = await getStamina();
-      if (stamina.stamina !== undefined && stamina.stamina < 1) {
-        console.log('Нет выносливости, покупаю...');
-        await buyStamina();
-        await sleep(5000);
+      // 2. Если майнинг в процессе
+      if (state.miningState === 1) {
+        // Если у нас нет сохранённого estimatedEnd, но майнинг уже идёт (например, после перезапуска) –
+        // попробуем получить estimatedEnd из ответа startMining? Не можем, потому что не мы запускали.
+        // Будем ждать и проверять, не изменилось ли состояние на 2.
+        if (currentEstimatedEnd && Date.now() >= currentEstimatedEnd) {
+          console.log('Время майнинга истекло, вызываю endMining...');
+          const endResult = await endMining();
+          if (endResult?.code === 0) {
+            console.log('Майнинг завершён успешно!');
+            // Выводим баланс после завершения
+            const stamina = await getStamina();
+            console.log(`[БАЛАНС] Выносливость: ${stamina.stamina}, Алмазы: ${stamina.diamond || 'нет данных'}`);
+            currentEstimatedEnd = null;
+          } else if (endResult?.code === 2018) {
+            console.log('Майнинг ещё не завершён, жду расчётное время...');
+          } else {
+            console.log('Ошибка завершения майнинга, повтор через 30 сек.');
+            await sleep(30000);
+            continue;
+          }
+        } else {
+          console.log('Майнинг выполняется, ожидаю завершения...');
+          await sleep(60000); // Проверяем раз в минуту
+        }
+        continue;
       }
 
-      const start = await startMining();
-      if (start?.code === 0) {
-        console.log('Майнинг запущен!');
-        errors = 0;
-        await sleep(300000);
-      } else if (start?.code === 2009) {
-        console.log('Конфликт состояний, жду...');
-        await sleep(30000);
-      } else if (start?.code === 2003) {
-        console.log('Недостаточно выносливости, покупаю...');
-        await buyStamina();
+      // 3. Если ожидается награда (miningState === 2)
+      if (state.miningState === 2) {
+        console.log('Ожидается награда за майнинг, вызываю endMining для фиксации...');
+        const endResult = await endMining();
+        if (endResult?.code === 0) {
+          console.log('Награда получена!');
+          const stamina = await getStamina();
+          console.log(`[БАЛАНС] Выносливость: ${stamina.stamina}, Алмазы: ${stamina.diamond || 'нет данных'}`);
+        } else {
+          console.log('Не удалось завершить ожидающую награду, попробую позже.');
+        }
         await sleep(10000);
-      } else if (start?.code === 2014) {
-        console.log('API майнинг не активирован в игре!');
+        continue;
+      }
+
+      // 4. Если майнинг не идёт (MiningIdle = 0)
+      // Проверяем выносливость
+      const stamina = await getStamina();
+      if (stamina.stamina !== undefined && stamina.stamina < 1) {
+        console.log('Недостаточно выносливости, покупаю...');
+        const buyResult = await buyStamina();
+        if (buyResult?.code !== 0) {
+          console.log('Не удалось купить выносливость, жду 60 сек.');
+          await sleep(60000);
+          continue;
+        }
+        await sleep(3000);
+      }
+
+      // Запускаем майнинг
+      console.log('Запускаю новый майнинг...');
+      const startResult = await startMining();
+      if (startResult?.code === 0 && startResult?.data?.estimatedEndAt) {
+        currentEstimatedEnd = startResult.data.estimatedEndAt;
+        console.log(`Майнинг запущен, завершится в ${new Date(currentEstimatedEnd).toISOString()}`);
+      } else if (startResult?.code === 2003) {
+        console.log('Всё ещё недостаточно выносливости, покупаю ещё раз...');
+        await buyStamina();
+        await sleep(5000);
+        continue;
+      } else if (startResult?.code === 2009) {
+        console.log('Конфликт состояний, сброс estimatedEnd и повтор через 30 сек.');
+        currentEstimatedEnd = null;
+        await sleep(30000);
+        continue;
+      } else if (startResult?.code === 2014) {
+        console.log('API майнинг не активирован в игре! Проверьте настройки.');
         await sleep(300000);
+        continue;
       } else {
         errors++;
+        console.log(`Неизвестный ответ при старте, ошибка #${errors}`);
         await sleep(30000);
+        continue;
       }
+
+      errors = 0; // Сброс счётчика ошибок после успешного старта
     } catch (err) {
       errors++;
-      console.error(`Ошибка #${errors}:`, err.message);
+      console.error(`Критическая ошибка #${errors}:`, err.message);
       await sleep(30000);
     }
   }
-  console.log('Слишком много ошибок, остановка.');
+  console.log('Слишком много ошибок, остановка цикла.');
 }
 
-// Минимальный HTTP-сервер для Render
+// HTTP-сервер для Render
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Mining OK');
+  res.end('ClawQuest Miner Active');
 }).listen(PORT, () => {
   console.log(`HTTP-сервер на порту ${PORT}`);
 });
