@@ -2,7 +2,8 @@
   "name": "clawquest-miner",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "dependencies": {
-    "@zhzai30/clawquest-agent-mine-openclaw": "latest"
+    "node-fetch": "^3.3.2"
   }
 }
