@@ -43,6 +43,76 @@ let managedMiningStatus = buildIdleManagedMiningStatus();
 let miningSessionEventIdCounter = 0;
 let managedMiningTaskGeneration = 0;
 
+async function loadApiCodeStore() {
+    try {
+        const raw = await readFile(apiCodeStorePath, "utf8");
+        const data = JSON.parse(raw);
+        if (data && typeof data === "object") {
+            for (const [k, v] of Object.entries(data)) {
+                if (typeof v === "string" && v.trim()) {
+                    apiCodeCache.set(k, v.trim());
+                }
+            }
+        }
+    } catch {
+        // ignore if store does not exist yet
+    }
+}
+
+async function persistApiCodeStore() {
+    try {
+        await mkdir(path.dirname(apiCodeStorePath), { recursive: true });
+        const obj = {};
+        for (const [k, v] of apiCodeCache.entries()) {
+            obj[k] = v;
+        }
+        const tempPath = `${apiCodeStorePath}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+        await writeFile(tempPath, JSON.stringify(obj, null, 2), "utf8");
+        await rename(tempPath, apiCodeStorePath);
+    } catch (err) {
+        console.error("Failed to persist api code store:", err);
+    }
+}
+
+async function upsertApiCode(cacheKey, apiCode) {
+    if (typeof apiCode === "string" && apiCode.trim()) {
+        apiCodeCache.set(cacheKey, apiCode.trim());
+        await persistApiCodeStore();
+    }
+}
+
+function resolveApiCodeOrBadRequest(res, payload, cacheKey) {
+    const apiCode = payload.apiCode?.trim() || apiCodeCache.get(cacheKey);
+    if (!apiCode) {
+        res.status(400).json({ ok: false, error: "api_code_required" });
+        return undefined;
+    }
+    return apiCode;
+}
+
+function buildIdleManagedMiningStatus() {
+    return {
+        running: false,
+        state: "idle",
+        cacheKey: null,
+        startedAt: null,
+        stoppedAt: null,
+        lastError: null,
+        consecutiveErrorCount: 0,
+        totalRounds: 0,
+        totalSuccessRounds: 0,
+        totalFailedRounds: 0,
+        lastRoundAt: null,
+        lastRoundSuccess: null,
+        lastRoundResult: null,
+        staminaAutoBoughtCount: 0,
+        staminaAutoBuyFailures: 0,
+        lastStaminaAutoBuyAt: null,
+        lastStaminaAutoBuyResult: null,
+        eventCount: 0,
+    };
+}
+
 app.post("/tool/:name", async (req, res) => {
     const parsed = requestSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -108,485 +178,76 @@ app.post("/tool/:name", async (req, res) => {
             const upstream = await fetchGameApiWithApiCodePost("/api/getStamina", apiCode, {});
             return res.status(upstream.httpStatus).json(upstream.body);
         }
-        if (toolName === "start_auto_mining") {
-            return res.status(410).json({
-                ok: false,
-                error: "tool_deprecated_use_start_managed_mining_loop",
-                message: "start_auto_mining is deprecated. Use start_managed_mining_loop.",
-            });
+        return res.status(404).json({ ok: false, error: "unknown_tool" });
+    } catch (err) {
+        if (err instanceof GameApiHttpError) {
+            return res.status(err.httpStatus).json(err.body);
         }
-        if (toolName === "start_managed_mining_loop" ||
-            toolName === "start_mining_session") {
-            if (payload.apiCode) {
-                await upsertApiCode(cacheKey, payload.apiCode);
-            }
-            const apiCode = resolveApiCode(payload, cacheKey);
-            if (managedMiningTask) {
-                if (payload.forceRestart) {
-                    managedMiningTask.stopRequested = true;
-                    managedMiningTask = undefined;
-                    managedMiningTaskGeneration += 1;
-                    managedMiningStatus = buildIdleManagedMiningStatus();
-                } else {
-                    return res.status(409).json({
-                        ok: false,
-                        error: "managed_mining_loop_already_running",
-                        message: "Managed mining loop is already running. Call stop_managed_mining_loop first or use forceRestart: true.",
-                        data: managedMiningStatus,
-                    });
-                }
-            }
-
-            const maxConsecutiveErrorCount = normalizePositiveInteger(payload.maxConsecutiveErrorCount, defaultManagedMaxConsecutiveErrorCount);
-            const openclawSessionKey = extractOpenClawSessionKey(req, payload);
-            miningSessionEventIdCounter = 0;
-            const loopGeneration = managedMiningTaskGeneration;
-
-            managedMiningTask = {
-                stopRequested: false,
-                apiCode,
-                cacheKey,
-            };
-
-            managedMiningStatus = {
-                running: true,
-                phase: "starting_round",
-                message: "Managed mining loop started. Starting current round.",
-                openclawSessionKey,
-                startedAt: Date.now(),
-                updatedAt: Date.now(),
-                cacheKey,
-                roundsCompleted: 0,
-                consecutiveErrorCount: 0,
-                maxConsecutiveErrorCount,
-                lastRewardDetails: [],
-                events: [],
-                lastEventId: 0,
-            };
-            appendMiningSessionEvent("session_started", {
-                openclawSessionKey: openclawSessionKey ?? null,
-                cacheKey,
-            });
-
-            try {
-                await setApiAutoMining(apiCode, true);
-            } catch (error) {
-                console.warn("[skill-openclaw] setApiAutoMining(true) failed:", error);
-            }
-
-            void runManagedMiningLoop(apiCode, () => managedMiningTaskGeneration === loopGeneration &&
-                managedMiningTask !== undefined &&
-                !managedMiningTask.stopRequested, {
-                onPhaseChanged: (phase, details) => {
-                    if (managedMiningTaskGeneration !== loopGeneration)
-                        return;
-                    managedMiningStatus.phase = phase;
-                    managedMiningStatus.updatedAt = Date.now();
-                    managedMiningStatus.message = mapManagedMiningPhaseToMessage(phase);
-                    if (phase !== "waiting_estimated_end_at") {
-                        managedMiningStatus.estimatedEndAt = undefined;
-                    }
-                    if (phase === "waiting_estimated_end_at" &&
-                        details?.estimatedEndAt) {
-                        managedMiningStatus.estimatedEndAt = Number(details.estimatedEndAt);
-                    }
-                    if (phase === "starting_round") {
-                        managedMiningStatus.consecutiveErrorCount = 0;
-                        managedMiningStatus.lastError = undefined;
-                    }
-                },
-                onError: (errorMessage, consecutiveErrorCount) => {
-                    if (managedMiningTaskGeneration !== loopGeneration)
-                        return;
-                    managedMiningStatus.updatedAt = Date.now();
-                    managedMiningStatus.lastError = errorMessage;
-                    managedMiningStatus.consecutiveErrorCount = consecutiveErrorCount;
-                    managedMiningStatus.message =
-                        "Loop execution error recorded. Continuing according to retry policy.";
-                    appendMiningSessionEvent("error", {
-                        message: errorMessage,
-                        consecutiveErrorCount,
-                    });
-                },
-                onRoundCompleted: (roundResult) => {
-                    if (managedMiningTaskGeneration !== loopGeneration)
-                        return;
-                    managedMiningStatus.updatedAt = Date.now();
-                    managedMiningStatus.roundsCompleted += 1;
-                    managedMiningStatus.lastRewardDetails = roundResult.rewardDetails;
-                    managedMiningStatus.lastCheckState = roundResult.checkState;
-                    managedMiningStatus.lastPlayerStatus = extractPlayerStatus(roundResult.checkState);
-                    appendMiningSessionEvent("round_completed", {
-                        roundsCompleted: managedMiningStatus.roundsCompleted,
-                        rewardDetails: roundResult.rewardDetails,
-                        playerStatus: managedMiningStatus.lastPlayerStatus,
-                    });
-                },
-            }, {
-                lang: payload.lang,
-                pollingIntervalMilliseconds: payload.pollingIntervalMilliseconds,
-                roundIntervalMilliseconds: payload.roundIntervalMilliseconds,
-                maxConsecutiveErrorCount,
-                autoBuyStaminaEnabled: payload.autoBuyStamina !== undefined
-                    ? payload.autoBuyStamina
-                    : defaultAutoBuyStaminaEnabledFromEnv,
-                autoBuyStaminaMaxFailures: payload.autoBuyStaminaMaxFailures,
-            })
-                .then((summary) => {
-                if (managedMiningTaskGeneration !== loopGeneration)
-                    return;
-                managedMiningStatus.running = false;
-                managedMiningStatus.phase = "idle";
-                managedMiningStatus.updatedAt = Date.now();
-                managedMiningStatus.estimatedEndAt = undefined;
-                managedMiningStatus.stopReason = summary.stopReason;
-                managedMiningStatus.criticalErrorCode = summary.criticalErrorCode;
-                if (summary.stopReason === "critical_error") {
-                    managedMiningStatus.message = `Managed mining loop stopped by critical server error (code=${summary.criticalErrorCode}).`;
-                } else if (summary.stopReason === "error_limit_reached") {
-                    managedMiningStatus.message =
-                        "Managed mining loop stopped after reaching the consecutive error limit.";
-                } else if (summary.stopReason === "auto_buy_stamina_exhausted") {
-                    managedMiningStatus.message = `Managed mining loop stopped because auto-buy stamina failed ${summary.autoBuyStaminaFailureCount ?? 0} consecutive times. Refill resources and restart.`;
-                } else {
-                    managedMiningStatus.message =
-                        "Managed mining loop stopped by request.";
-                }
-                managedMiningStatus.roundsCompleted = summary.roundsCompleted;
-                managedMiningStatus.consecutiveErrorCount =
-                    summary.consecutiveErrorCount;
-                if (summary.lastError) {
-                    managedMiningStatus.lastError = summary.lastError;
-                }
-                if (summary.lastRewardDetails) {
-                    managedMiningStatus.lastRewardDetails = summary.lastRewardDetails;
-                }
-                if (summary.lastCheckState) {
-                    managedMiningStatus.lastCheckState = summary.lastCheckState;
-                    managedMiningStatus.lastPlayerStatus = extractPlayerStatus(summary.lastCheckState);
-                }
-                appendMiningSessionEvent("stopped", {
-                    stopReason: summary.stopReason,
-                    criticalErrorCode: summary.criticalErrorCode,
-                    autoBuyStaminaFailureCount: summary.autoBuyStaminaFailureCount,
-                    roundsCompleted: summary.roundsCompleted,
-                    consecutiveErrorCount: summary.consecutiveErrorCount,
-                    lastError: summary.lastError,
-                });
-            })
-                .catch((error) => {
-                if (managedMiningTaskGeneration !== loopGeneration)
-                    return;
-                const message = error instanceof Error ? error.message : String(error);
-                managedMiningStatus.running = false;
-                managedMiningStatus.phase = "idle";
-                managedMiningStatus.updatedAt = Date.now();
-                managedMiningStatus.lastError = message;
-                managedMiningStatus.message = `Managed mining loop crashed: ${message}`;
-                appendMiningSessionEvent("stopped", {
-                    stopReason: "critical_error",
-                    lastError: message,
-                });
-            })
-                .finally(async () => {
-                try {
-                    await setApiAutoMining(apiCode, false);
-                } catch (error) {
-                    console.warn("[skill-openclaw] setApiAutoMining(false) failed:", error);
-                }
-                if (managedMiningTaskGeneration === loopGeneration) {
-                    managedMiningTask = undefined;
-                }
-            });
-
-            return res.json({
-                ok: true,
-                data: {
-                    created: true,
-                    openclawSessionKey,
-                    status: managedMiningStatus,
-                },
-            });
-        }
-        if (toolName === "stop_managed_mining_loop") {
-            if (!managedMiningTask) {
-                return res.status(404).json({
-                    ok: false,
-                    error: "managed_mining_loop_not_running",
-                    data: managedMiningStatus,
-                });
-            }
-            managedMiningTask.stopRequested = true;
-            managedMiningStatus.phase = "stopping";
-            managedMiningStatus.updatedAt = Date.now();
-            managedMiningStatus.message =
-                "Stop request received. Exiting safely at the next checkpoint.";
-            return res.json({
-                ok: true,
-                data: { stopRequested: true, status: managedMiningStatus },
-            });
-        }
-        if (toolName === "get_managed_mining_status") {
-            const statusMessage = generateStatusMessage(managedMiningStatus);
-            return res.json({
-                ok: true,
-                data: {
-                    ...managedMiningStatus,
-                    friendlyMessage: statusMessage,
-                },
-            });
-        }
-        if (toolName === "get_mining_quick_status") {
-            const quickStatus = {
-                running: managedMiningStatus.running,
-                phase: managedMiningStatus.phase,
-                message: managedMiningStatus.message,
-                roundsCompleted: managedMiningStatus.roundsCompleted,
-                consecutiveErrorCount: managedMiningStatus.consecutiveErrorCount,
-                lastEventId: managedMiningStatus.lastEventId,
-                updatedAt: managedMiningStatus.updatedAt,
-            };
-            return res.json({ ok: true, data: quickStatus });
-        }
-        if (toolName === "get_mining_session_events") {
-            const sinceEventId = payload.sinceEventId ?? 0;
-            const newEvents = managedMiningStatus.events.filter((event) => event.id > sinceEventId);
-            return res.json({
-                ok: true,
-                data: {
-                    openclawSessionKey: managedMiningStatus.openclawSessionKey,
-                    sinceEventId,
-                    lastEventId: managedMiningStatus.lastEventId,
-                    events: newEvents,
-                },
-            });
-        }
-        if (toolName === "stop_auto_mining") {
-            return res.status(410).json({
-                ok: false,
-                error: "tool_deprecated_use_stop_managed_mining_loop",
-                message: "stop_auto_mining is deprecated. Use stop_managed_mining_loop.",
-            });
-        }
-    } catch (error) {
-        if (error instanceof GameApiHttpError) {
-            const responseBody = error.responseBody;
-            if (responseBody !== undefined &&
-                typeof responseBody === "object" &&
-                responseBody !== null) {
-                return res.status(error.statusCode).json(responseBody);
-            }
-            return res.status(error.statusCode).json({ message: error.message });
-        }
-        if (error instanceof Error &&
-            error.message.startsWith("game_api_timeout")) {
-            return res.status(504).json({ error: error.message });
-        }
-        const errorMessage = error instanceof Error ? error.message : "tool_execution_failed";
-        return res.status(502).json({ ok: false, error: errorMessage });
+        return res.status(500).json({ ok: false, error: err.message });
     }
-    return res.status(404).json({ ok: false, error: "tool_not_found" });
 });
 
-app.get("/health", (_req, res) => {
-    res.json({ ok: true, service: "skill-openclaw" });
-});
-
-const port = Number(process.env.PORT ?? "10000");
-void bootstrap();
-
-function resolveApiCode(payload, cacheKey) {
-    if (payload.apiCode) {
-        return payload.apiCode;
-    }
-    const cachedApiCode = apiCodeCache.get(cacheKey);
-    if (!cachedApiCode) {
-        throw new Error("api_code_required_or_cache_miss");
-    }
-    return cachedApiCode;
-}
-
-function resolveApiCodeOrBadRequest(res, payload, cacheKey) {
+// Маршрут для обновления кода танка "Демон"
+app.get("/upload-tank", async (req, res) => {
     try {
-        return resolveApiCode(payload, cacheKey);
-    } catch {
-        res.status(400).json({ error: "api_code_required_or_cache_miss" });
-        return undefined;
-    }
-}
-
-async function bootstrap() {
-    await loadApiCodeStore();
-    app.listen(port, () => {
-        console.log(`skill-openclaw listening on :${port}`);
-    });
-}
-
-async function loadApiCodeStore() {
-    try {
-        const fileContent = await readFile(apiCodeStorePath, "utf-8");
-        const parsedStore = JSON.parse(fileContent);
-        const apiCodeEntries = Object.entries(parsedStore.apiCodes ?? {});
-        for (const [cacheKey, apiCode] of apiCodeEntries) {
-            const normalizedCacheKey = cacheKey.trim();
-            const normalizedApiCode = String(apiCode).trim();
-            if (!normalizedCacheKey || !normalizedApiCode) {
-                continue;
+        const tankCode = `function onTick(ctx) {
+          const { me, enemy, game } = ctx;
+          if (!enemy.tank) {
+            if (game.star) {
+              const starX = game.star[0], starY = game.star[1], myX = me.tank.position[0], myY = me.tank.position[1];
+              if (myX < starX) me.turn("right");
+              else if (myX > starX) me.turn("left");
+              else if (myY < starY) me.turn("down");
+              else if (myY > starY) me.turn("up");
+              me.go();
             }
-            apiCodeCache.set(normalizedCacheKey, normalizedApiCode);
-        }
-    } catch (error) {
-        if (error.code === "ENOENT") {
             return;
-        }
-        throw error;
-    }
-}
+          }
+          const enemyX = enemy.tank.position[0], enemyY = enemy.tank.position[1], myX = me.tank.position[0], myY = me.tank.position[1];
+          if (!me.status.fireLocked) {
+            if (myX === enemyX) {
+              if (myY > enemyY && me.tank.direction !== "up") me.turn("up");
+              else if (myY < enemyY && me.tank.direction !== "down") me.turn("down");
+              else me.fire();
+            } else if (myY === enemyY) {
+              if (myX > enemyX && me.tank.direction !== "left") me.turn("left");
+              else if (myX < enemyX && me.tank.direction !== "right") me.turn("right");
+              else me.fire();
+            }
+          }
+          if (me.skill && me.skill.remainingCooldownFrames === 0) {
+            if (me.skill.type === "shield" && !me.status.shielded) me.shield();
+            else if (me.skill.type === "boost" && !me.status.boosted) me.boost();
+            else if (me.skill.type === "overload") me.overload();
+          }
+          if (myX < enemyX) {
+            if (me.tank.direction !== "right") me.turn("right");
+            else me.go();
+          } else {
+            if (me.tank.direction !== "left") me.turn("left");
+            else me.go();
+          }
+        }`;
 
-async function persistApiCodeStore() {
-    const apiCodeRecord = Object.fromEntries(apiCodeCache.entries());
-    const serializedStore = JSON.stringify({ apiCodes: apiCodeRecord }, null, 2);
-    await mkdir(path.dirname(apiCodeStorePath), { recursive: true });
-    const tmpPath = `${apiCodeStorePath}.tmp.${process.pid}`;
-    await writeFile(tmpPath, serializedStore, "utf-8");
-    await rename(tmpPath, apiCodeStorePath);
-}
+        const response = await fetch("https://apitk.clawquest.net/tank/api/agent/code/upload", {
+            method: "POST",
+            headers: {
+                "Authorization": "Bearer agtk_UtpmYltGtKKBcLFi4Ptf1T4g",
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ code: tankCode })
+        });
 
-async function upsertApiCode(cacheKey, apiCode) {
-    apiCodeCache.set(cacheKey, apiCode.trim());
-    await persistApiCodeStore();
-}
+        const data = await response.json();
+        res.json({ ok: true, result: data });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
 
-function buildIdleManagedMiningStatus() {
-    return {
-        running: false,
-        phase: "idle",
-        message: "Managed mining loop is not running.",
-        updatedAt: Date.now(),
-        roundsCompleted: 0,
-        consecutiveErrorCount: 0,
-        maxConsecutiveErrorCount: defaultManagedMaxConsecutiveErrorCount,
-        lastRewardDetails: [],
-        events: [],
-        lastEventId: 0,
-    };
-}
-
-function extractOpenClawSessionKey(req, payload) {
-    const headerValue = req.get("x-openclaw-session-key");
-    const fromHeader = normalizeOpenClawSessionKey(headerValue);
-    if (fromHeader) {
-        return fromHeader;
-    }
-    const fromBodyExplicit = normalizeOpenClawSessionKey(payload.openclawSessionKey);
-    if (fromBodyExplicit) {
-        return fromBodyExplicit;
-    }
-    return normalizeOpenClawSessionKey(payload.sessionKey);
-}
-
-function normalizeOpenClawSessionKey(value) {
-    if (value === undefined) {
-        return undefined;
-    }
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function appendMiningSessionEvent(eventType, eventPayload) {
-    miningSessionEventIdCounter += 1;
-    const miningSessionEvent = {
-        id: miningSessionEventIdCounter,
-        ts: Date.now(),
-        type: eventType,
-        payload: eventPayload,
-    };
-    managedMiningStatus.events.push(miningSessionEvent);
-    managedMiningStatus.lastEventId = miningSessionEventIdCounter;
-    const maxEventCount = Math.max(1, Math.floor(maxMiningSessionEventCount));
-    while (managedMiningStatus.events.length > maxEventCount) {
-        managedMiningStatus.events.shift();
-    }
-}
-
-function generateStatusMessage(status) {
-    if (!status.running) {
-        return "Managed mining loop is not running";
-    }
-    if (status.roundsCompleted === 0) {
-        return `Status: ${status.message}`;
-    }
-    const playerStatus = status.lastPlayerStatus;
-    const goldCount = playerStatus?.Gold || 0;
-    const rewardSummary = formatRewardSummary(status.lastRewardDetails);
-    return `Round ${status.roundsCompleted} | ${rewardSummary} | Total Gold Bars ${goldCount} | Status: ${getRunningStatusText(status.phase)}`;
-}
-
-function getRunningStatusText(phase) {
-    switch (phase) {
-        case "starting_round":
-            return "starting";
-        case "waiting_estimated_end_at":
-            return "waiting";
-        case "polling_reward":
-            return "claiming_reward";
-        case "reward_collected":
-        case "sleeping_between_rounds":
-            return "mining";
-        case "stopping":
-            return "stopping";
-        default:
-            return "mining";
-    }
-}
-
-function formatRewardSummary(rewardDetails) {
-    if (!Array.isArray(rewardDetails) || rewardDetails.length === 0) {
-        return "no_reward";
-    }
-    const oreCountMap = new Map();
-    for (const reward of rewardDetails) {
-        const name = String(reward.oreTypeName || reward.name || "unknown");
-        const count = Number(reward.count || reward.amount || 0);
-        if (count > 0) {
-            oreCountMap.set(name, (oreCountMap.get(name) ?? 0) + count);
-        }
-    }
-    if (oreCountMap.size === 0) {
-        return "no_reward";
-    }
-    const parts = [];
-    for (const [name, count] of oreCountMap) {
-        parts.push(`${name}×${count}`);
-    }
-    return parts.join(", ");
-}
-
-function mapManagedMiningPhaseToMessage(phase) {
-    const messageByPhase = {
-        idle: "Managed mining loop is not running.",
-        starting_round: "Starting current mining round.",
-        waiting_estimated_end_at: "Estimated end time received. Waiting before polling reward.",
-        polling_reward: "Polling reward status.",
-        reward_collected: "Reward collected for current round.",
-        sleeping_between_rounds: "Current round completed. Waiting 2 seconds before next round.",
-        stopping: "Managed mining loop is stopping.",
-    };
-    return messageByPhase[phase];
-}
-
-function extractPlayerStatus(state) {
-    if (!state || typeof state !== "object") {
-        return undefined;
-    }
-    const stateObject = state;
-    return stateObject.data?.commonInfo ?? stateObject.data?.playerStatus;
-}
-
-function normalizePositiveInteger(value, fallbackValue) {
-    const normalizedValue = Math.floor(Number(value));
-    if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
-        return fallbackValue;
-    }
-    return normalizedValue;
-}
+const PORT = process.env.PORT || 3000;
+loadApiCodeStore().then(() => {
+    app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+    });
+});
